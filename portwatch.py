@@ -4,7 +4,7 @@
 Web  : sudo python3 portwatch.py      puis http://127.0.0.1:9999
 Shell: sudo python3 portwatch.py --cli
 """
-import hmac, json, os, pwd, re, signal, subprocess, sys, time
+import hmac, json, os, pwd, re, signal, subprocess, sys, threading, time
 import urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -14,6 +14,12 @@ HOST, PORT = "127.0.0.1", 9999   # "0.0.0.0" pour accès depuis un autre PC (dé
 TOKEN = ""                       # si défini : accès via http://ip:9999/?token=MONTOKEN
 ENABLE_ACTIONS = True            # boutons Démarrer / Redémarrer / Arrêter
 REFRESH = 3                      # secondes entre deux rafraîchissements
+
+# Alertes envoyées par le serveur à chaque changement d'état d'un port de WATCH,
+# même si aucune page n'est ouverte. Laissez vide pour désactiver (aucun coût).
+NTFY_URL = ""        # ex. "https://ntfy.sh/mon-sujet-secret" -> notification sur votre téléphone (appli ntfy)
+NOTIFY_CMD = []      # ex. ["/opt/portwatch/alerte.sh", "{title}", "{msg}"] (script d'e-mail, Telegram...)
+WATCH_INTERVAL = 5   # secondes entre deux vérifications côté serveur
 
 # port, name, desc : obligatoires
 # expect : mot attendu dans le processus (sinon pastille orange "occupé par autre chose")
@@ -151,6 +157,46 @@ def do_action(port, act):
     return 400, "Action inconnue"
 
 
+STATE_TXT = {"up": "actif", "down": "inactif", "warn": "à vérifier"}
+
+
+def notify(title, msg, state):
+    if NTFY_URL:
+        u = urlparse(NTFY_URL)
+        body = json.dumps({"topic": u.path.strip("/"), "title": title, "message": msg,
+                           "priority": 5 if state == "down" else 3,
+                           "tags": [{"down": "red_circle", "up": "green_circle", "warn": "warning"}[state]]})
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"{u.scheme}://{u.netloc}", data=body.encode(),
+                headers={"Content-Type": "application/json"}), timeout=5)
+        except Exception:
+            pass
+    if NOTIFY_CMD:
+        try:
+            subprocess.run([a.replace("{title}", title).replace("{msg}", msg) for a in NOTIFY_CMD], timeout=10)
+        except Exception:
+            pass
+
+
+def watcher():
+    prev = None
+    while True:
+        try:
+            cur = {r["port"]: r for r in status()["rows"] if r["watched"]}
+            if prev is not None:
+                for p, r in cur.items():
+                    if prev.get(p) not in (None, r["state"]):
+                        msg = f"Port {p} : {STATE_TXT[prev[p]]} -> {STATE_TXT[r['state']]}"
+                        if r.get("msg"):
+                            msg += f"\n{r['msg']}"
+                        notify(f"portwatch : {r['name']}", msg, r["state"])
+            prev = {p: r["state"] for p, r in cur.items()}
+        except Exception:
+            pass
+        time.sleep(WATCH_INTERVAL)
+
+
 PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Ports</title>
 <style>
@@ -173,6 +219,7 @@ button,a.btn{font:inherit;font-size:.8rem;padding:.15rem .6rem;border:1px solid 
 dl.dt{display:grid;grid-template-columns:8rem 1fr;gap:.2rem .8rem;margin:0;padding:.2rem 0 .8rem 1.6rem;font-size:.8rem}
 .dt dt{color:var(--mu)}.dt dd{margin:0;overflow-wrap:anywhere;font-family:ui-monospace,monospace}
 .acts{grid-column:1/-1;display:flex;gap:.5rem;flex-wrap:wrap}
+.kill{color:#e74c3c;border-color:#e74c3c;font-weight:600}
 .bn{background:#f39c1233;border:1px solid #f39c12;padding:.4rem .8rem;border-radius:.4rem;margin-bottom:.8rem;font-size:.85rem}
 #lg{font:.8rem ui-monospace,monospace;color:var(--mu);padding:.4rem 0;max-height:12rem;overflow:auto}
 details{margin-top:1.2rem}summary{cursor:pointer;color:var(--mu);font-size:.85rem}
@@ -181,6 +228,8 @@ details{margin-top:1.2rem}summary{cursor:pointer;color:var(--mu);font-size:.85re
 <header><h1>Ports</h1><span id=sum></span>
 <input id=q type=search placeholder="Filtrer (port, nom, chemin...)">
 <label><input id=ow type=checkbox> Surveillés seulement</label>
+<label><input id=cf type=checkbox checked> Confirmer les kill</label>
+<button id=nt></button><button id=sd></button><button id=st title="Écouter chaque son">Écouter les sons</button>
 <button id=pz>Pause</button></header>
 <div id=bn class=bn hidden></div>
 <div id=l></div>
@@ -198,21 +247,54 @@ function fmtUp(s){if(s==null)return'';const d=Math.floor(s/86400),h=Math.floor(s
 function log(txt){const d=el('div','',new Date().toLocaleTimeString()+'  '+txt);$('#lg').prepend(d);
  while($('#lg').children.length>50)$('#lg').lastChild.remove()}
 async function act(port,a,label){
- if(!confirm(label+' - port '+port+' ?'))return;
+ if(label&&!confirm(label+' - port '+port+' ?'))return;
  try{const r=await fetch('/act'+Q,{method:'POST',headers:{'X-Portwatch':'1','Content-Type':'application/json'},body:JSON.stringify({port,act:a})});
   toast((await r.json()).msg)}catch(e){toast('Erreur réseau')}
  setTimeout(tick,800)}
-function btn(txt,fn){const b=el('button','',txt);b.onclick=e=>{e.stopPropagation();fn()};return b}
+function btn(txt,fn,c){const b=el('button',c||'',txt);b.onclick=e=>{e.stopPropagation();fn(e)};return b}
+const ls={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+function kill(s,force){
+ if($('#cf').checked&&!confirm((force?'FORCER l\'arrêt de ':'Arrêter ')+s.name+' (port '+s.port+', PID '+s.pid+') ?'))return;
+ act(s.port,force?'kill':'term',null)}
+const EM={up:'🟢',down:'🔴',warn:'🟠'},COL={up:'#2ecc71',down:'#e74c3c',warn:'#f39c12'};
+let baseTitle='Ports',al=null,notif=ls.get('pw_notif')==='1'&&'Notification' in window&&Notification.permission==='granted';
+function fav(st){let l=document.querySelector('link[rel=icon]');if(!l){l=el('link');l.rel='icon';document.head.append(l)}
+ l.href='data:image/svg+xml,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="'+COL[st]+'"/></svg>')}
+function alarm(s,a,b){
+ const t=EM[b]+' '+s.name+' : '+LBL[b];al={txt:t,until:Date.now()+30000};
+ if(notif)try{new Notification(t,{body:'Port '+s.port+' ('+LBL[a]+' -> '+LBL[b]+')'+(s.msg?'\n'+s.msg:''),tag:'pw'+s.port,requireInteraction:b==='down'})}catch(e){}}
+function updNt(){$('#nt').textContent=notif?'🔔 Notifications activées':'🔕 Notifications désactivées'}
+let sound=ls.get('pw_sound')==='1',actx=null,busy=0;
+const SND={
+ 'down>up':{n:'Rouge -> vert : service démarré',s:[[523,.12],[659,.12],[784,.25]]},
+ 'up>down':{n:'Vert -> rouge : service arrêté',s:[[659,.15],[494,.15],[370,.15],[247,.4]]},
+ 'up>warn':{n:'Vert -> orange : problème',s:[[440,.15,'square'],[0,.1],[440,.15,'square']]},
+ 'warn>down':{n:'Orange -> rouge : service tombé',s:[[262,.1,'sawtooth'],[0,.05],[262,.1,'sawtooth'],[0,.05],[262,.1,'sawtooth'],[0,.05],[196,.4,'sawtooth']]},
+ 'down>warn':{n:'Rouge -> orange : démarrage en cours',s:[[330,.2],[440,.2]]},
+ 'warn>up':{n:'Orange -> vert : rétabli',s:[[587,.1],[880,.25]]}};
+function ctx(){if(!actx)actx=new(window.AudioContext||window.webkitAudioContext)();if(actx.state==='suspended')actx.resume();return actx}
+function snd(k){
+ if(!sound||!SND[k])return;
+ try{const c=ctx();let t=Math.max(c.currentTime,busy)+.05;
+  for(const[f,d,ty]of SND[k].s){
+   if(f){const o=c.createOscillator(),g=c.createGain();o.type=ty||'sine';o.frequency.value=f;
+    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(ty?.1:.2,t+.02);g.gain.exponentialRampToValueAtTime(.0001,t+d);
+    o.connect(g);g.connect(c.destination);o.start(t);o.stop(t+d+.05)}
+   t+=d+.05}
+  busy=t+.3}catch(e){}}
+function updSnd(){$('#sd').textContent=!sound?'🔇 Son désactivé':(actx&&actx.state==='running'?'🔔 Son activé':'🔔 Son activé (cliquez sur la page)')}
 function render(d){
  const f=$('#q').value.toLowerCase(),ow=$('#ow').checked,l=$('#l');l.textContent='';
  const cur={};let bad=0,w=0,okw=0;
  for(const s of d.rows){cur[s.port]=s.state;if(s.watched){w++;s.state==='up'?okw++:bad++}}
  if(prev){for(const p in cur)if(prev[p]!==cur[p]){const s=d.rows.find(x=>x.port==p);
-   log(p+' '+s.name+' : '+(prev[p]?LBL[prev[p]]+' -> ':'ouvert -> ')+LBL[cur[p]])}
+   log(p+' '+s.name+' : '+(prev[p]?LBL[prev[p]]+' -> ':'ouvert -> ')+LBL[cur[p]]);
+   if(s.watched&&prev[p]){snd(prev[p]+'>'+cur[p]);alarm(s,prev[p],cur[p])}}
   for(const p in prev)if(!(p in cur))log(p+' : fermé')}
  prev=cur;
  $('#sum').textContent=okw+'/'+w+' surveillés actifs · '+d.rows.filter(s=>s.state!=='down').length+' ports ouverts · '+new Date().toLocaleTimeString();
- document.title=(bad?'🔴 '+bad:'🟢')+' · Ports';
+ const wst=d.rows.some(s=>s.watched&&s.state==='down')?'down':d.rows.some(s=>s.watched&&s.state==='warn')?'warn':'up';
+ baseTitle=EM[wst]+(bad?' '+bad:'')+' · Ports';fav(wst);
  const bn=$('#bn'),notes=[];
  if(!d.root)notes.push('Non lancé en root : noms de processus et actions indisponibles pour certains ports.');
  if(!d.actions)notes.push('Actions désactivées (accès non local sans TOKEN, ou ENABLE_ACTIONS=False).');
@@ -230,6 +312,8 @@ function render(d){
   if(s.msg)m.append(el('span','b ko','⚠ '+s.msg));
   if(s.web&&s.state!=='down'){const u='http://'+location.hostname+':'+s.port;
    const a=el('a','btn','Ouvrir');a.href=u;a.target='_blank';a.onclick=e=>e.stopPropagation();m.append(a,btn('Copier l\'URL',()=>copy(u)))}
+  if(d.actions&&s.state!=='down'&&s.pid){const k=btn('Kill',e=>kill(s,e.shiftKey),'kill');
+   k.title='Clic : arrêt normal (SIGTERM) · Maj+clic : arrêt forcé (SIGKILL)';m.append(k)}
   r.append(m);
   if(open.has(s.port)){
    const dl=el('dl','dt'),add=(k,v)=>{if(v!=null&&v!=='')dl.append(el('dt','',k),el('dd','',v))};
@@ -246,12 +330,24 @@ function render(d){
    dl.append(ac);r.append(dl)}
   l.append(r)}}
 async function tick(){
- if(document.hidden||paused)return;
+ if(paused)return;
  try{last=await(await fetch('/api'+Q)).json();render(last)}
  catch(e){$('#bn').hidden=false;$('#bn').textContent='Serveur portwatch injoignable...'}}
 $('#q').oninput=$('#ow').onchange=()=>last&&render(last);
 $('#pz').onclick=()=>{paused=!paused;$('#pz').textContent=paused?'Reprendre':'Pause';tick()};
-tick();setInterval(tick,REFRESH*1000);
+$('#cf').checked=ls.get('pw_cf')!=='0';
+$('#cf').onchange=()=>ls.set('pw_cf',$('#cf').checked?'1':'0');
+$('#sd').onclick=()=>{sound=!sound;ls.set('pw_sound',sound?'1':'0');if(sound){ctx();snd('warn>up')}updSnd()};
+$('#st').onclick=()=>{if(!sound){toast('Activez d\'abord le son');return}
+ const ks=Object.keys(SND);let i=0;(function nx(){if(i>=ks.length)return;const k=ks[i++];toast(SND[k].n);snd(k);setTimeout(nx,1800)})()};
+document.addEventListener('pointerdown',()=>{if(sound){ctx();setTimeout(updSnd,150)}},{once:true});
+$('#nt').onclick=()=>{
+ if(notif){notif=false;ls.set('pw_notif','0');updNt();return}
+ if(!('Notification' in window)||!window.isSecureContext){toast('Notifications indisponibles ici : ouvrez la page via http://localhost:'+location.port+' (ou en https)');return}
+ Notification.requestPermission().then(p=>{notif=p==='granted';ls.set('pw_notif',notif?'1':'0');updNt();
+  if(notif)new Notification('portwatch',{body:'Notifications activées'});else toast('Permission refusée par le navigateur')})};
+setInterval(()=>{document.title=(al&&Date.now()<al.until&&Math.floor(Date.now()/1000)%2)?al.txt:baseTitle},1000);
+updNt();updSnd();tick();setInterval(tick,REFRESH*1000);
 </script>""".replace("__R__", str(REFRESH))
 
 
@@ -314,4 +410,7 @@ if __name__ == "__main__":
     print(f"portwatch sur http://{HOST}:{PORT}" + (f"/?token={TOKEN}" if TOKEN else ""), file=sys.stderr)
     if not ACTIONS_OK and ENABLE_ACTIONS:
         print("Actions désactivées : accès non local sans TOKEN.", file=sys.stderr)
+    if NTFY_URL or NOTIFY_CMD:
+        threading.Thread(target=watcher, daemon=True).start()
+        print("Alertes serveur actives", file=sys.stderr)
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()
